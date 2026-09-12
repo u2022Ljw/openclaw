@@ -164,8 +164,12 @@ package root; a broken same-ID source copy does not trigger replacement of a
 healthy managed package.
 
 With `--json`, stdout contains one JSON document. Doctor panels and other
-diagnostics go to stderr, so stdout can be parsed directly. Failed doctor or
-plugin finalization steps still exit non-zero.
+diagnostics go to stderr, so stdout can be parsed directly. Plugin-only
+availability, installation, or load failures appear in
+`postUpdate.plugins.warnings`; finalization reports `status: "warning"` and exits
+successfully when required checks pass. Failed required Doctor execution,
+invalid configuration or state, ownership errors, and failed required readiness
+checks still exit nonzero.
 
 Doctor repair uses the same enabled-plugin and default-check selection as
 ordinary Doctor lint. Opt-in checks, including the managed Codex version probe,
@@ -223,9 +227,13 @@ overall deadline still fails finalization.
 Plugin artifacts that require capability consent are not installed without an
 interactive review or explicit `--accept-capabilities`. `--yes` alone does not
 accept capability changes, and JSON mode does not prompt. An unresolved review
-preserves the previous plugin, exits non-zero, and blocks any requested Gateway
-restart. This also applies when a bundled plugin moves to an external package or
-a missing configured plugin has no install record yet. Automatic repair can
+preserves the previous plugin payload and appears in `postUpdate.plugins.warnings`
+with a `PLUGIN_CAPABILITY_CONSENT_REQUIRED` outcome. When required checks pass,
+`openclaw update` can complete the core update and requested Gateway restart with
+`status: "ok"`; `update repair` reports `status: "warning"` and never restarts the
+Gateway. Both commands exit successfully. This also applies when a bundled plugin
+moves to an external package or a missing configured plugin has no install record
+yet; the unreviewed replacement is not installed. Automatic repair can
 report a deferred replacement as a notice when a usable, enabled artifact remains
 installed; that retained artifact still undergoes payload validation.
 
