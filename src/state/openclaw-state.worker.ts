@@ -1,7 +1,9 @@
+import type { WorktreeTemplateWorkerOperations } from "../agents/worktrees/template-registry.worker.js";
 import {
   loadDeviceIdentityIfPresent,
   loadOrCreateDeviceIdentity,
 } from "../infra/device-identity.js";
+import { refreshSqlitePlannerStatistics } from "../infra/sqlite-planner-statistics.js";
 import { assertNoActiveSqliteReaders } from "../infra/sqlite-reader-lifecycle.js";
 import { assertTransactionUsable } from "../infra/sqlite-transaction.js";
 import { SQLITE_WORKER_PREPARE_COMMAND } from "../infra/sqlite-worker-contract.js";
@@ -35,7 +37,45 @@ import {
 import type {
   OpenClawStateWorkerBackend,
   OpenClawStateWorkerOpenPreparation,
+  OpenClawStateWorkerOperations,
 } from "./openclaw-state-worker-contract.js";
+import {
+  createWorkerOperationRegistry,
+  type WorkerWriteOperationContext,
+} from "./worker-operation-registry.js";
+
+// Device auth and PR provisioning prepare without loading the application runtime.
+const commandRegistry = createWorkerOperationRegistry<
+  WorktreeTemplateWorkerOperations &
+    Pick<
+      OpenClawStateWorkerOperations,
+      | "worktrees.reserveCapacity"
+      | "worktrees.recoverPending"
+      | Extract<keyof OpenClawStateWorkerOperations, `deviceAuth.${string}`>
+    >,
+  WorkerWriteOperationContext
+>({
+  deviceAuth: async () =>
+    (await import("../infra/device-auth-store.worker.js")).deviceAuthWorkerOperations,
+  worktrees: async () => {
+    const [templates, reserveCapacity, recoverPending] = await Promise.all([
+      import("../agents/worktrees/template-registry.worker.js").then(
+        (loaded) => loaded.worktreeTemplateOperations,
+      ),
+      import("../agents/worktrees/capacity.worker.js").then(
+        (loaded) => loaded.reserveWorktreeCapacityInWorker,
+      ),
+      import("../agents/worktrees/registry-run-end.worker.js").then(
+        (loaded) => loaded.recoverPendingWorktreesInWorker,
+      ),
+    ]);
+    return {
+      ...templates,
+      "worktrees.reserveCapacity": reserveCapacity,
+      "worktrees.recoverPending": recoverPending,
+    };
+  },
+});
 
 let agentCleanup: typeof import("./openclaw-agent-execution-cleanup.worker.js") | undefined;
 let pluginState: typeof import("../plugin-state/plugin-state.worker.js") | undefined;
@@ -93,7 +133,7 @@ function createSharedStateWorkerBackend(
   let borrow = nativeDatabase ? retainOpenClawStateDatabase(nativeDatabase) : undefined;
   let closed = false;
   let secretSchemaAdmitted = false;
-  const open = (): OpenClawStateDatabase => {
+  const retainedDatabase = (): OpenClawStateDatabase => {
     if (!nativeDatabase) {
       const opened = openOpenClawStateDatabase({
         path: context.databasePath,
@@ -110,14 +150,44 @@ function createSharedStateWorkerBackend(
     ) {
       throw new Error("Shared-state worker lost its retained native database");
     }
-    return openOpenClawStateDatabase({
-      database: nativeDatabase,
+    return nativeDatabase;
+  };
+  const open = (): OpenClawStateDatabase =>
+    openOpenClawStateDatabase({
+      database: retainedDatabase(),
       path: context.databasePath,
       env: getSqliteWorkerStateContext().environment,
     });
+  // The transaction owner validates schema and write authority after BEGIN.
+  const write: WorkerWriteOperationContext["write"] = (operation, transactionOptions) =>
+    runOpenClawStateWriteTransaction(
+      operation,
+      {
+        database: retainedDatabase(),
+        path: context.databasePath,
+        env: getSqliteWorkerStateContext().environment,
+      },
+      transactionOptions,
+    );
+  const writeAdmitted: WorkerWriteOperationContext["writeAdmitted"] = (operation, options) => {
+    open();
+    return write((database) => {
+      requestSqliteWorkerOperationAdmission({ stage: "transaction", facts: undefined });
+      const result = operation(database);
+      requestSqliteWorkerOperationAdmission({ stage: "commit", facts: undefined });
+      return result;
+    }, options);
   };
   return {
     [SQLITE_WORKER_PREPARE_COMMAND](commandType) {
+      if (
+        commandType.startsWith("deviceAuth.") ||
+        commandType.startsWith("worktrees.templates.") ||
+        commandType === "worktrees.reserveCapacity" ||
+        commandType === "worktrees.recoverPending"
+      ) {
+        return commandRegistry.prepare(commandType);
+      }
       if (commandType.startsWith("capture.")) {
         if (capture) {
           return undefined;
@@ -167,6 +237,17 @@ function createSharedStateWorkerBackend(
       if (closed) {
         throw new Error("Shared-state worker is closed");
       }
+      if (commandRegistry.has(command)) {
+        return commandRegistry.execute(command, {
+          open,
+          write,
+          writeAdmitted,
+          stateOptions: () => ({
+            path: context.databasePath,
+            env: getSqliteWorkerStateContext().environment,
+          }),
+        });
+      }
       if (
         command.type === "capture.upsertSession" ||
         command.type === "capture.endSession" ||
@@ -202,12 +283,14 @@ function createSharedStateWorkerBackend(
           });
         } finally {
           // An existing-only actor may acquire its first writable handle through this owner.
-          const database = openClawStateDatabaseCache.getCachedOpenClawStateDatabase(
-            context.databasePath,
-          );
-          if (!nativeDatabase && database) {
-            borrow = retainOpenClawStateDatabase(database);
-            nativeDatabase = database;
+          if (!nativeDatabase) {
+            const database = openClawStateDatabaseCache.getCachedOpenClawStateDatabase(
+              context.databasePath,
+            );
+            if (database) {
+              borrow = retainOpenClawStateDatabase(database);
+              nativeDatabase = database;
+            }
           }
         }
       }
@@ -243,10 +326,22 @@ function createSharedStateWorkerBackend(
         );
       }
       if (command.type === "database.walMaintenance") {
+        const database = open();
+        const admit = (stage: "transaction" | "commit") => {
+          requestSqliteWorkerOperationAdmission({ stage, facts: undefined });
+        };
         return (
-          open().walMaintenance.maintainPeriodic?.(command.input, (stage) => {
-            requestSqliteWorkerOperationAdmission({ stage, facts: undefined });
-          }) ?? { reclaimedPages: 0 }
+          database.walMaintenance.maintainPeriodic?.(command.input, admit, () =>
+            runOpenClawStateWriteTransaction(
+              ({ db }) => {
+                admit("transaction");
+                refreshSqlitePlannerStatistics(db);
+                admit("commit");
+              },
+              { database },
+              { busyTimeoutMs: 0, operationLabel: "state.planner-statistics" },
+            ),
+          ) ?? { reclaimedPages: 0 }
         );
       }
       if (command.type === "database.inspectIdle") {
@@ -275,7 +370,7 @@ function createSharedStateWorkerBackend(
             path: context.databasePath,
             env: getSqliteWorkerStateContext().environment,
           },
-          open,
+          retainedDatabase,
           nativeDatabase?.db.isOpen === true,
         );
       }
@@ -297,6 +392,8 @@ function createSharedStateWorkerBackend(
         command,
         context,
         open,
+        write,
+        writeAdmitted,
         () =>
           (updateRunWriter ??= currentRuntime.openUpdateRunWriter({
             path: context.databasePath,
