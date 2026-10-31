@@ -373,6 +373,33 @@ describe("settings sidebar search", () => {
     expect(onExit).toHaveBeenCalledOnce();
   });
 
+  it("clears the visible search before its projected query commits", () => {
+    const onExit = vi.fn();
+    const onSearchQueryChange = vi.fn((searchQuery: string) => {
+      setProps((current) => ({ ...current, searchQuery }));
+    });
+    const [props, setProps] = createSignal(sidebarProps({ onExit, onSearchQueryChange }));
+    mountSolid(() => <SettingsSidebar {...props()} />, { container });
+    flush();
+    const input = container.querySelector<HTMLInputElement>(".settings-sidebar__search-input")!;
+    input.focus();
+    input.value = "appearance";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(onSearchQueryChange).toHaveBeenLastCalledWith("");
+    expect(input.value).toBe("");
+    expect(document.activeElement).toBe(input);
+    expect(onExit).not.toHaveBeenCalled();
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(onExit).toHaveBeenCalledOnce();
+  });
+
   it("renders refreshed settings route titles from the active locale", async () => {
     render({});
 
@@ -552,7 +579,8 @@ describe("Settings agent selector", () => {
       expect(selector.querySelector<HTMLButtonElement>(".agent-select__trigger")?.disabled).toBe(
         true,
       );
-      expect(selector.querySelectorAll("[data-agent-option]")).toHaveLength(count);
+      expect(selector.options).toHaveLength(count);
+      expect(selector.querySelectorAll("[data-agent-option]")).toHaveLength(0);
       expect(selector.options.some((option) => option.value === "system")).toBe(false);
     },
   );
@@ -577,6 +605,10 @@ describe("Settings agent selector", () => {
       "cycle-a",
       "cycle-b",
     ]);
+    selector.querySelector<HTMLButtonElement>(".agent-select__trigger")!.click();
+    await waitForSolid(() =>
+      expect(selector.querySelectorAll("[data-agent-option]")).toHaveLength(5),
+    );
     const rows = selector.querySelectorAll("[data-agent-option]");
     expect(rows[1]?.querySelector(".agent-select__option-description")?.textContent?.trim()).toBe(
       t("agents.createdBy", { id: "main" }),
@@ -671,6 +703,10 @@ it("follows agent owner replacement and publications without remounting", async 
   const selectionSubscriptions = [...selectionListeners];
   const identitySubscriptions = [...identityListeners];
   const subscriptions = [selectionSubscriptions, identitySubscriptions];
+  selector.querySelector<HTMLButtonElement>(".agent-select__trigger")!.click();
+  await waitForSolid(() =>
+    expect(selector.querySelector(".agent-select__option-copy")).not.toBeNull(),
+  );
   const optionCopy = selector.querySelector(".agent-select__option-copy");
   expect(optionCopy).not.toBeNull();
   render({ ...props, gatewayVersion: "test" });
